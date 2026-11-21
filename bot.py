@@ -2,6 +2,7 @@
 ربات بله - پست‌گذاری خودکار محصولات فروشگاه در کانال
 - منبع محصولات: جدول products در Supabase (product_id, name, slug, permalink, image_url)
 - هیچ همگام‌سازی خودکاری با سایت وجود ندارد؛ محصول جدید فقط با ارسال لینک به ربات اضافه می‌شود
+- مقصدها: بله، تلگرام و روبیکا (هرکدام که توکن و مقصدش تنظیم شود)، همه با یک متن و یک محصول در هر اسلات
 - متن پست: Gemini با چرخش بین چند کلید
 """
 import io
@@ -32,7 +33,7 @@ def env(name, default=None, required=False):
     return v
 
 BALE_TOKEN = env("BALE_TOKEN", required=True)
-CHANNEL_ID = env("CHANNEL_ID", required=True)          # مثل @mychannel
+BALE_TARGET = env("BALE_TARGET") or env("CHANNEL_ID")    # مقصد پست در بله: @channel یا شناسه‌ی عددی (اختیاری)
 SB_URL = env("SUPABASE_URL", required=True).rstrip("/")
 SB_KEY = env("SUPABASE_KEY", required=True)
 GEMINI_KEYS = [k.strip() for k in env("GEMINI_KEYS", "").split(",") if k.strip()]
@@ -42,6 +43,7 @@ ADMIN_USERNAME = env("ADMIN_USERNAME", "").lstrip("@")
 ADMIN_PHONE = env("ADMIN_PHONE", "")
 ADMIN_USER_IDS = {int(x) for x in env("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()}
 POST_TIMES = [t.strip() for t in env("POST_TIMES", "10:00,13:00,16:00,19:00,21:00").split(",") if t.strip()]
+RUBIKA_LINK_BUTTON = env("RUBIKA_LINK_BUTTON", "false").lower() == "true"
 ORDER_MODE = env("ORDER_MODE", "random")               # random | sequential
 CATCHUP_MINUTES = int(env("CATCHUP_MINUTES", "180"))   # اگر سرور خواب بود تا چند دقیقه دیرتر هم پست بزند
 TZ = ZoneInfo(env("TZ_NAME", "Asia/Tehran"))
@@ -162,21 +164,15 @@ def ai_body(p):
     txt = re.sub(r"[*`\[\]]", "", txt).strip()
     return txt[:350]
 
-def build_caption(p):
-    lines = [f"✅ {p['name']}", "", ai_body(p), "", "🌐 برای مشاهده قیمت و سفارش وارد سایت شوید"]
-    if ADMIN_USERNAME:
-        lines.append(f"💬 سفارش: @{ADMIN_USERNAME}")
+def build_caption(p, body, plat):
+    lines = [f"✅ {p['name']}", "", body, "", "🌐 برای مشاهده قیمت و سفارش وارد سایت شوید"]
+    if plat.admin:
+        lines.append(f"💬 سفارش: @{plat.admin}")
     if ADMIN_PHONE:
         lines.append(f"📞 {ADMIN_PHONE}")
     return "\n".join(lines)[:1000]
 
-def build_keyboard(p):
-    rows = [[{"text": "مشاهده در سایت", "url": p["permalink"]}]]
-    if ADMIN_USERNAME:
-        rows.append([{"text": "ارسال پیام", "url": f"https://ble.ir/{ADMIN_USERNAME}"}])
-    return {"inline_keyboard": rows}
-
-# ------------------------- ارسال به بله -------------------------
+# ------------------------- پلتفرم‌ها (بله / تلگرام / روبیکا) -------------------------
 def prepare_image(url):
     """تصویر را دانلود و به JPEG سبک تبدیل می‌کند (webp/png سنگین مشکل‌ساز است)."""
     r = requests.get(url, headers=UA, timeout=40)
@@ -198,26 +194,111 @@ def prepare_image(url):
     except Exception:
         return r.content
 
-def bale_send_post(p, caption):
-    kb = json.dumps(build_keyboard(p), ensure_ascii=False)
-    try:
-        img = prepare_image(p["image_url"])
-        r = requests.post(f"{BALE_API}/sendPhoto",
-                          data={"chat_id": CHANNEL_ID, "caption": caption, "reply_markup": kb},
-                          files={"photo": ("product.jpg", img, "image/jpeg")}, timeout=90)
-        j = r.json()
-        if j.get("ok"):
-            return True
-        log.warning("sendPhoto خطا: %s", j)
-    except Exception as e:
-        log.warning("sendPhoto exception: %s", e)
-    # فالبک: متن + لینک (اگر دکمه یا عکس مشکل داشت)
-    text = f"{caption}\n\n🔗 {p['permalink']}"
-    r = requests.post(f"{BALE_API}/sendMessage", json={"chat_id": CHANNEL_ID, "text": text}, timeout=30)
-    ok = r.json().get("ok", False)
-    if not ok:
-        log.error("sendMessage هم خطا داد: %s", r.text[:300])
-    return ok
+class Platform:
+    name = ""
+    def __init__(self, token, target, admin):
+        self.token, self.target, self.admin = token, target, (admin or "").lstrip("@")
+    def admin_url(self):
+        return None
+    def send_post(self, p, caption, img):
+        raise NotImplementedError
+
+class TgLike(Platform):
+    """بله و تلگرام ساختار Bot API یکسان دارند (sendPhoto + دکمه‌ی inline با url)."""
+    api = ""
+    def keyboard(self, p):
+        rows = [[{"text": "مشاهده در سایت", "url": p["permalink"]}]]
+        if self.admin:
+            rows.append([{"text": "ارسال پیام", "url": self.admin_url()}])
+        return {"inline_keyboard": rows}
+    def send_post(self, p, caption, img):
+        if img:
+            try:
+                r = requests.post(f"{self.api}/sendPhoto",
+                                  data={"chat_id": self.target, "caption": caption,
+                                        "reply_markup": json.dumps(self.keyboard(p), ensure_ascii=False)},
+                                  files={"photo": ("product.jpg", img, "image/jpeg")}, timeout=90)
+                j = r.json()
+                if j.get("ok"):
+                    return True
+                log.warning("%s sendPhoto خطا: %s", self.name, j)
+            except Exception as e:
+                log.warning("%s sendPhoto exception: %s", self.name, e)
+        # فالبک: متن + لینک
+        r = requests.post(f"{self.api}/sendMessage",
+                          json={"chat_id": self.target, "text": f"{caption}\n\n🔗 {p['permalink']}"}, timeout=30)
+        ok = r.json().get("ok", False)
+        if not ok:
+            log.error("%s sendMessage هم خطا داد: %s", self.name, r.text[:300])
+        return ok
+
+class Bale(TgLike):
+    name = "bale"
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.api = f"https://tapi.bale.ai/bot{self.token}"
+    def admin_url(self):
+        return f"https://ble.ir/{self.admin}"
+
+class Telegram(TgLike):
+    name = "telegram"
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.api = f"https://api.telegram.org/bot{self.token}"
+    def admin_url(self):
+        return f"https://t.me/{self.admin}"
+
+class Rubika(Platform):
+    """روبیکا: requestSendFile -> آپلود -> sendFile با text. لینک همیشه داخل متن هم می‌آید."""
+    name = "rubika"
+    def _call(self, method, payload):
+        r = requests.post(f"https://botapi.rubika.ir/v3/{self.token}/{method}", json=payload, timeout=40)
+        return r.json()
+    @staticmethod
+    def _ok(j):
+        return str(j.get("status", "")).upper() == "OK"
+    def send_post(self, p, caption, img):
+        text = f"{caption}\n\n🔗 {p['permalink']}"
+        if img:
+            try:
+                j = self._call("requestSendFile", {"type": "Image"})
+                upload_url = (j.get("data") or j).get("upload_url")
+                up = requests.post(upload_url, files={"file": ("product.jpg", img, "image/jpeg")}, timeout=90).json()
+                file_id = (up.get("data") or up).get("file_id")
+                if file_id:
+                    payload = {"chat_id": self.target, "file_id": file_id, "text": text}
+                    if RUBIKA_LINK_BUTTON:   # آزمایشی: فیلد لینک در مستندات نیست
+                        payload["inline_keypad"] = {"rows": [{"buttons": [{
+                            "id": "site", "type": "Link", "button_text": "مشاهده در سایت",
+                            "button_link": {"type": "url", "link_url": p["permalink"]}}]}]}
+                    j = self._call("sendFile", payload)
+                    if self._ok(j):
+                        return True
+                    if RUBIKA_LINK_BUTTON:   # بدون دکمه دوباره تلاش کن
+                        payload.pop("inline_keypad", None)
+                        if self._ok(self._call("sendFile", payload)):
+                            return True
+                    log.warning("rubika sendFile خطا: %s", j)
+            except Exception as e:
+                log.warning("rubika file exception: %s", e)
+        j = self._call("sendMessage", {"chat_id": self.target, "text": text})
+        if not self._ok(j):
+            log.error("rubika sendMessage خطا: %s", j)
+        return self._ok(j)
+
+def build_platforms():
+    out = []
+    def adm(key):
+        return env(f"ADMIN_USERNAME_{key}", "") or ADMIN_USERNAME
+    if BALE_TARGET:
+        out.append(Bale(BALE_TOKEN, BALE_TARGET, adm("BALE")))
+    if env("TELEGRAM_TOKEN") and env("TELEGRAM_TARGET"):
+        out.append(Telegram(env("TELEGRAM_TOKEN"), env("TELEGRAM_TARGET"), adm("TELEGRAM")))
+    if env("RUBIKA_TOKEN") and env("RUBIKA_TARGET"):
+        out.append(Rubika(env("RUBIKA_TOKEN"), env("RUBIKA_TARGET"), adm("RUBIKA")))
+    return out
+
+PLATFORMS = build_platforms()
 
 def bale_msg(chat_id, text):
     try:
@@ -225,9 +306,11 @@ def bale_msg(chat_id, text):
     except Exception as e:
         log.warning("bale_msg: %s", e)
 
-# ------------------------- ارسال یک اسلات -------------------------
+# ------------------------- ارسال یک اسلات (همه‌ی پلتفرم‌ها با هم) -------------------------
 def do_post(slot_key):
-    """اسلات را در Supabase قفل می‌کند (جلوگیری از پست دوبل) و یک محصول می‌فرستد."""
+    """اسلات را قفل می‌کند (ضد پست دوبل)، یک محصول انتخاب می‌کند و به همه‌ی پلتفرم‌های فعال می‌فرستد."""
+    if not PLATFORMS:
+        return "هیچ پلتفرمی فعال نیست (توکن و مقصد را تنظیم کنید)"
     r = sb("POST", "post_slots", None, [{"slot": slot_key}], "return=minimal")
     if r.status_code == 409 or (not r.ok and "duplicate" in r.text.lower()):
         return "قبلاً انجام شده"
@@ -238,15 +321,30 @@ def do_post(slot_key):
     if not p:
         sb("DELETE", "post_slots", {"slot": f"eq.{slot_key}"})
         return "محصول آماده‌ای نیست"
-    if bale_send_post(p, build_caption(p)):
+    body = ai_body(p)                       # یک بار تولید متن برای همه‌ی پلتفرم‌ها
+    try:
+        img = prepare_image(p["image_url"])
+    except Exception as e:
+        log.warning("دانلود عکس ناموفق: %s", e)
+        img = None
+    results = {}
+    for plat in PLATFORMS:
+        try:
+            results[plat.name] = bool(plat.send_post(p, build_caption(p, body, plat), img))
+        except Exception as e:
+            log.warning("%s: %s", plat.name, e)
+            results[plat.name] = False
+    summary = " ".join(f"{k}:{'✅' if v else '❌'}" for k, v in results.items())
+    if any(results.values()):
         sb("PATCH", T, {"product_id": f"eq.{p['product_id']}"},
            {"posted_count": p["posted_count"] + 1, "last_posted_at": datetime.utcnow().isoformat() + "Z"})
         sb("PATCH", "post_slots", {"slot": f"eq.{slot_key}"}, {"product_id": p["product_id"]})
-        return f"ارسال شد: {p['name']}"
+        return f"ارسال شد: {p['name']}\n{summary}"
     sb("DELETE", "post_slots", {"slot": f"eq.{slot_key}"})   # اسلات آزاد شود تا دوباره تلاش شود
-    return "ارسال ناموفق"
+    return f"ارسال ناموفق ({summary})"
 
 # ------------------------- زمان‌بند (ترد پس‌زمینه) -------------------------
+_retry_after = {}
 def scheduler_loop():
     time.sleep(5)
     while True:
@@ -256,8 +354,13 @@ def scheduler_loop():
                 hh, mm = map(int, t.split(":"))
                 due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
                 if due <= now <= due + timedelta(minutes=CATCHUP_MINUTES):
-                    res = do_post(f"{now:%Y-%m-%d}_{t}")
-                    if res not in ("قبلاً انجام شده",):
+                    slot = f"{now:%Y-%m-%d}_{t}"
+                    if _retry_after.get(slot, 0) > time.time():
+                        continue
+                    res = do_post(slot)
+                    if res.startswith(("ارسال ناموفق", "خطای دیتابیس", "محصول آماده‌ای نیست", "هیچ پلتفرمی")):
+                        _retry_after[slot] = time.time() + 900     # ۱۵ دقیقه صبر بعد از شکست
+                    if res != "قبلاً انجام شده":
                         log.info("اسلات %s: %s", t, res)
         except Exception as e:
             log.exception("scheduler: %s", e)
@@ -278,7 +381,8 @@ def status_text():
     mn = min(i["posted_count"] for i in items)
     left = sum(1 for i in items if i["posted_count"] == mn)
     return (f"محصولات فعال: {len(items)}\nدور فعلی چرخه: {mn + 1}\n"
-            f"باقی‌مانده تا پایان این دور: {left}\nساعت‌های پست: {', '.join(POST_TIMES)}")
+            f"باقی‌مانده تا پایان این دور: {left}\nساعت‌های پست: {', '.join(POST_TIMES)}\n"
+            f"پلتفرم‌های فعال: {', '.join(x.name for x in PLATFORMS) or '-'}")
 
 def bale_menu(chat, text="چه کاری انجام بدم؟"):
     try:
@@ -388,6 +492,36 @@ def home():
 @app.get("/health")
 def health():
     return jsonify(status="up", time=datetime.now(TZ).isoformat())
+
+
+@app.get("/rubika-id")
+def rubika_id():
+    """صفحه‌ی موقت برای پیدا کردن chat_id روبیکا. فقط با SETUP_KEY کار می‌کند؛ بعد از استفاده SETUP_KEY را حذف کنید."""
+    from flask import request, Response
+    key = env("SETUP_KEY")
+    if not key or request.args.get("key") != key:
+        return "forbidden", 403
+    tok = env("RUBIKA_TOKEN")
+    if not tok:
+        return Response("RUBIKA_TOKEN تنظیم نشده", 400, mimetype="text/plain; charset=utf-8")
+    try:
+        r = requests.post(f"https://botapi.rubika.ir/v3/{tok}/getUpdates", json={"limit": 50}, timeout=30)
+        data = r.json()
+    except Exception as e:
+        return Response(f"خطا: {e}", 500, mimetype="text/plain; charset=utf-8")
+    ups = (data.get("data") or data).get("updates") or []
+    out, seen = [], set()
+    for u in ups:
+        cid = u.get("chat_id") or (u.get("new_message") or {}).get("chat_id")
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        txt = ((u.get("new_message") or {}).get("text") or "")[:40]
+        out.append(f"chat_id: {cid}   (نوع رویداد: {u.get('type')}  متن: {txt})")
+    if not out:
+        out = ["چیزی پیدا نشد. اول در روبیکا یک پیام بفرستید (به ربات یا داخل کانال) و صفحه را دوباره باز کنید.",
+               "پاسخ خام روبیکا:", json.dumps(data, ensure_ascii=False)[:1500]]
+    return Response("\n".join(out), mimetype="text/plain; charset=utf-8")
 
 _started = False
 def start_background():
