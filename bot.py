@@ -1,11 +1,10 @@
 """
-ربات بله - پست‌گذاری خودکار محصولات فروشگاه در کانال
-- منبع محصولات: فایل CSV خروجی پنل ووکامرس (ارسال به ربات در بله) + افزودن تکی با لینک
-- هیچ سینک خودکاری با سایت وجود ندارد. تنها درخواست به سایت: وقتی ادمین «لینک محصول» می‌دهد (۱ درخواست).
-- ذخیره‌سازی: Supabase (چرخه‌ی پست، جلوگیری از تکرار، اسلات‌ها)
+ربات بله - پست‌گذاری خودکار محصولات فروشگاه (ووکامرس) در کانال
+- منبع محصولات: فایل CSV خروجی پنل (یک‌بار) + افزودن تکی با لینک؛ هیچ همگام‌سازی خودکاری با سایت نیست
+- ذخیره‌سازی: Supabase (چرخه‌ی پست، جلوگیری از تکرار، لاگ اسلات‌ها)
 - متن پست: Gemini با چرخش بین چند کلید
 """
-import hashlib
+import csv
 import io
 import json
 import logging
@@ -14,49 +13,41 @@ import random
 import re
 import threading
 import time
-from datetime import datetime, timedelta, timezone
-from urllib.parse import unquote, urlparse, parse_qs
+import zlib
+from datetime import datetime, timedelta
+from html import unescape
 from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, jsonify
 
-from csv_import import parse_products_csv, strip_html
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
 
-
-# ------------------------- تنظیمات (Environment Variables رندر) -------------------------
+# ------------------------- تنظیمات (از Environment Variables) -------------------------
 def env(name, default=None, required=False):
     v = os.environ.get(name, default)
     if required and not v:
         raise RuntimeError(f"متغیر محیطی {name} تنظیم نشده است")
     return v
 
-
-BOT_TOKEN = env("BOT_TOKEN", required=True)
+BALE_TOKEN = env("BALE_TOKEN", required=True)
 CHANNEL_ID = env("CHANNEL_ID", required=True)          # مثل @mychannel
 SB_URL = env("SUPABASE_URL", required=True).rstrip("/")
 SB_KEY = env("SUPABASE_KEY", required=True)
-# چند کلید را با کاما (یا خط جدید) جدا کنید
-GEMINI_KEYS = [k.strip() for k in re.split(r"[,\s]+", env("GEMINI_API_KEY", "")) if k.strip()]
+GEMINI_KEYS = [k.strip() for k in env("GEMINI_KEYS", "").split(",") if k.strip()]
 GEMINI_MODEL = env("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_MAX_ATTEMPTS = int(env("GEMINI_MAX_ATTEMPTS", str(max(len(GEMINI_KEYS), 1))) or 1)
 SITE_URL = env("SITE_URL", "https://citysofal.ir").rstrip("/")
-SITE_HOST = urlparse(SITE_URL).netloc.lower().removeprefix("www.")
-ADMIN_IDS = {int(x) for x in re.split(r"[,\s]+", env("ADMIN_ID", "")) if x.strip().isdigit()}
-ADMIN_USERNAME = env("ADMIN_USERNAME", "").lstrip("@")   # آیدی بله برای چاپ در پست (اختیاری)
+ADMIN_USERNAME = env("ADMIN_USERNAME", "").lstrip("@")
 ADMIN_PHONE = env("ADMIN_PHONE", "")
+ADMIN_USER_IDS = {int(x) for x in env("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()}
 POST_TIMES = [t.strip() for t in env("POST_TIMES", "10:00,13:00,16:00,19:00,21:00").split(",") if t.strip()]
 ORDER_MODE = env("ORDER_MODE", "random")               # random | sequential
 SHOW_PRICE = env("SHOW_PRICE", "false").lower() == "true"
-PRICE_UNIT = env("PRICE_UNIT", "تومان")
 CATCHUP_MINUTES = int(env("CATCHUP_MINUTES", "180"))   # اگر سرور خواب بود تا چند دقیقه دیرتر هم پست بزند
 TZ = ZoneInfo(env("TZ_NAME", "Asia/Tehran"))
-BALE_API = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
-BALE_FILE = f"https://tapi.bale.ai/file/bot{BOT_TOKEN}"
-UA = {"User-Agent": "Mozilla/5.0 (compatible; CitySofalBot/2.0)"}
+BALE_API = f"https://tapi.bale.ai/bot{BALE_TOKEN}"
+UA = {"User-Agent": "Mozilla/5.0 (compatible; CitySofalBot/1.0)"}
 
 STYLE_HINTS = [
     "لحن گرم و صمیمی، تأکید بر زیبایی و حس خانه",
@@ -67,19 +58,14 @@ STYLE_HINTS = [
     "کوتاه، شاعرانه و دلنشین",
 ]
 
-
-def utcnow():
-    return datetime.now(timezone.utc).isoformat()
-
-
 # ------------------------- Supabase (REST ساده) -------------------------
 def sb(method, table, params=None, body=None, prefer=None):
     headers = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}", "Content-Type": "application/json"}
     if prefer:
         headers["Prefer"] = prefer
-    return requests.request(method, f"{SB_URL}/rest/v1/{table}", headers=headers,
-                            params=params, data=json.dumps(body) if body is not None else None, timeout=30)
-
+    r = requests.request(method, f"{SB_URL}/rest/v1/{table}", headers=headers,
+                         params=params, data=json.dumps(body) if body is not None else None, timeout=30)
+    return r
 
 def kv_get(k):
     r = sb("GET", "kv", {"k": f"eq.{k}", "select": "v"})
@@ -87,204 +73,136 @@ def kv_get(k):
         return r.json()[0]["v"]
     return None
 
-
 def kv_set(k, v):
     sb("POST", "kv", {"on_conflict": "k"}, [{"k": k, "v": str(v)}], "resolution=merge-duplicates")
 
+# ------------------------- ورود محصولات (CSV خروجی پنل + افزودن با لینک) -------------------------
+def strip_html(s):
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    return re.sub(r"\s+", " ", unescape(s)).strip()
 
-def kv_del(k):
-    sb("DELETE", "kv", {"k": f"eq.{k}"})
-
-
-def current_cycle_min():
-    """کمترین تعداد پستِ محصولات فعال = دور فعلی چرخه. محصول تازه باید با همین عدد وارد شود."""
-    r = sb("GET", "products", {"select": "posted_count", "active": "eq.true"})
-    items = r.json() if r.ok else []
-    return min((i["posted_count"] for i in items), default=0)
-
-
-def existing_ids():
-    ids, offset = set(), 0
-    while True:
-        r = sb("GET", "products", {"select": "id", "limit": 1000, "offset": offset})
-        chunk = r.json() if r.ok else []
-        ids |= {x["id"] for x in chunk}
-        if len(chunk) < 1000:
-            return ids
-        offset += 1000
-
-
-def save_rows(rows):
-    """ذخیره‌ی محصولات: جدیدها با posted_count دور فعلی، موجودها بدون دست‌زدن به شمارنده. خروجی: (جدید، به‌روز)."""
-    if not rows:
-        return 0, 0
-    have = existing_ids()
-    base = current_cycle_min()
-    new = [dict(r, posted_count=base) for r in rows if r["id"] not in have]
-    upd = [r for r in rows if r["id"] in have]
-    for batch in (new, upd):
-        for i in range(0, len(batch), 100):
-            r = sb("POST", "products", {"on_conflict": "id"}, batch[i:i + 100], "resolution=merge-duplicates")
-            if not r.ok:
-                raise RuntimeError(f"ذخیره در Supabase ناموفق: {r.text[:200]}")
-    return len(new), len(upd)
-
-
-# ------------------------- ایمپورت فایل CSV -------------------------
-def import_csv_bytes(data):
-    rows, drafts = parse_products_csv(data, SITE_URL, PRICE_UNIT)
-    if not rows and not drafts:
-        raise ValueError("هیچ محصولی در فایل پیدا نشد")
-    new, upd = save_rows(rows)
-    if drafts:
-        sb("PATCH", "products", {"id": f"in.({','.join(map(str, drafts))})"}, {"active": False})
-    off = sum(1 for r in rows if not r["active"])
-    noimg = sum(1 for r in rows if r["active"] and not r["image_url"])
-    msg = f"✅ فایل وارد شد\nجدید: {new}\nبه‌روزرسانی‌شده: {upd}"
-    if off:
-        msg += f"\nناموجود (کنار گذاشته شد): {off}"
-    if drafts:
-        msg += f"\nپیش‌نویس/منتشرنشده: {len(drafts)}"
-    if noimg:
-        msg += f"\n⚠️ بدون عکس (پست نمی‌شوند): {noimg}"
-    return msg
-
-
-# ------------------------- افزودن تکی با لینک -------------------------
-def _is_site_link(u):
+def fmt_num_price(x):
     try:
-        host = urlparse(u).netloc.lower().removeprefix("www.")
-        return host == SITE_HOST
+        return f"{int(float(str(x).replace(',', '').strip())):,} تومان"
     except Exception:
-        return False
+        return None
 
-
-def find_links(text):
-    return [u.rstrip(").,،") for u in re.findall(r"https?://[^\s]+", text or "") if _is_site_link(u.rstrip(").,،"))]
-
-
-def row_from_store_api(p):
-    imgs = p.get("images") or []
-    prices = p.get("prices") or {}
-    price = None
+def fmt_price(prices):
     try:
         minor = int(prices.get("currency_minor_unit", 0))
         val = int(prices["price"]) / (10 ** minor)
         if prices.get("currency_code") == "IRR":
             val /= 10
-        price = f"{int(val):,} {PRICE_UNIT}" if val > 0 else None
+        return f"{int(val):,} تومان"
     except Exception:
-        pass
+        return None
+
+def row_from_api(p):
+    imgs = p.get("images") or []
     return {
         "id": p["id"],
         "title": strip_html(p.get("name")),
         "url": p.get("permalink"),
         "image_url": imgs[0]["src"] if imgs else None,
-        "price": price,
+        "price": fmt_price(p.get("prices") or {}),
         "short_desc": strip_html(p.get("short_description"))[:600],
         "description": strip_html(p.get("description"))[:900],
         "categories": [strip_html(c["name"]) for c in (p.get("categories") or [])][:3],
+        "sort_order": int(time.time()) % 2_000_000_000,
         "active": bool(p.get("is_in_stock", True)),
-        "updated_at": utcnow(),
     }
 
-
-def _meta(html, prop):
-    m = re.search(r'<meta[^>]+(?:property|name)=["\']%s["\'][^>]+content=["\']([^"\']*)["\']' % re.escape(prop), html, re.I) \
-        or re.search(r'<meta[^>]+content=["\']([^"\']*)["\'][^>]+(?:property|name)=["\']%s["\']' % re.escape(prop), html, re.I)
-    return strip_html(m.group(1)) if m else None
-
-
-def row_from_html(url, html):
-    """فالبک: اگر API ووکامرس جواب نداد، از متاتگ‌های صفحه‌ی همان یک محصول می‌خوانیم."""
-    title = _meta(html, "og:title")
-    if not title:
-        m = re.search(r"<title>(.*?)</title>", html, re.S | re.I)
-        title = strip_html(m.group(1)) if m else None
-    if not title:
-        raise RuntimeError("عنوان محصول از صفحه خوانده نشد")
-    title = re.split(r"\s+[-–|–]\s+", title)[0].strip() or title
-    m = re.search(r"postid-(\d+)", html) or re.search(r"[?&]p=(\d+)", html)
-    pid = int(m.group(1)) if m else -int(hashlib.sha1(url.encode()).hexdigest()[:12], 16)
-    cats = [strip_html(c) for c in re.findall(r'rel=["\']tag["\'][^>]*>([^<]+)</a>', html)][:3]
-    return {
-        "id": pid,
-        "title": title,
-        "url": _meta(html, "og:url") or url,
-        "image_url": _meta(html, "og:image"),
-        "price": None,
-        "short_desc": (_meta(html, "og:description") or "")[:600],
-        "description": "",
-        "categories": cats,
-        "active": True,
-        "updated_at": utcnow(),
-    }
-
-
-def fetch_product_from_link(link):
-    """یک درخواست سبک به سایت برای همان یک محصول (فقط وقتی ادمین لینک می‌دهد)."""
-    u = urlparse(link)
-    q = parse_qs(u.query)
-    base = f"{SITE_URL}/wp-json/wc/store/v1/products"
-    attempts = []
-    if "p" in q and q["p"][0].isdigit():
-        attempts.append({"include": q["p"][0]})
-    else:
-        seg = [s for s in u.path.split("/") if s]
-        if seg:
-            slug_raw = seg[-1]
-            attempts.append(f"slug={slug_raw.lower()}")           # شکل انکودشده (ذخیره‌ی وردپرس)
-            attempts.append({"slug": unquote(slug_raw)})            # شکل فارسی
-    for params in attempts:
-        try:
-            r = requests.get(base, params=params, headers=UA, timeout=30)
-            if r.status_code == 200 and r.json():
-                return row_from_store_api(r.json()[0])
-        except Exception as e:
-            log.warning("store api: %s", e)
+def fetch_by_link(link):
+    """فقط همان یک محصول را از سایت می‌گیرد (۱ درخواست سبک)."""
+    from urllib.parse import urlparse, unquote
+    link = link.strip().rstrip(".,)»")
+    slug = unquote(urlparse(link).path.strip("/").split("/")[-1])
+    if slug:
+        r = requests.get(f"{SITE_URL}/wp-json/wc/store/v1/products",
+                         params={"slug": slug}, headers=UA, timeout=30)
+        if r.status_code == 200 and r.json():
+            return row_from_api(r.json()[0])
+    # فالبک: خواندن تگ‌های og از خود صفحه
     r = requests.get(link, headers=UA, timeout=30)
-    if r.status_code != 200:
-        raise RuntimeError(f"صفحه باز نشد (HTTP {r.status_code})")
-    return row_from_html(link, r.text)
+    r.raise_for_status()
+    def og(name):
+        m = re.search(r'<meta[^>]+property=["\']og:%s["\'][^>]+content=["\']([^"\']+)' % name, r.text)
+        return unescape(m.group(1)).strip() if m else None
+    title, image = og("title"), og("image")
+    if not title:
+        raise RuntimeError("اطلاعات محصول از لینک خوانده نشد")
+    title = re.sub(r"\s*[-–|]\s*شهر سفال\s*$", "", title)
+    return {"id": zlib.crc32(link.encode()), "title": title, "url": link, "image_url": image,
+            "price": None, "short_desc": (og("description") or "")[:600], "description": "",
+            "categories": [], "sort_order": int(time.time()) % 2_000_000_000, "active": True}
 
+def upsert_rows(rows):
+    # فقط ستون‌های موجود در rows به‌روز می‌شوند؛ posted_count و last_posted_at دست‌نخورده می‌مانند
+    for i in range(0, len(rows), 100):
+        r = sb("POST", "products", {"on_conflict": "id"}, rows[i:i + 100], "resolution=merge-duplicates")
+        if not r.ok:
+            raise RuntimeError(f"ذخیره در Supabase ناموفق: {r.text[:200]}")
 
-def add_from_links(links):
-    out = []
-    for link in links[:10]:
-        try:
-            row = fetch_product_from_link(link)
-            new, _ = save_rows([row])
-            note = "" if row.get("image_url") else " ⚠️ بدون عکس (پست نمی‌شود)"
-            out.append(f"{'➕ اضافه شد' if new else '🔄 از قبل بود، به‌روز شد'}: {row['title']}{note}")
-        except Exception as e:
-            out.append(f"❌ {link}\n   {e}")
-        time.sleep(1)
-    return "\n".join(out)
+_ALIASES = {
+    "id": ["id", "شناسه"],
+    "type": ["type", "نوع"],
+    "name": ["name", "نام"],
+    "published": ["published", "منتشر شده", "منتشرشده"],
+    "instock": ["in stock?", "in stock", "موجود؟", "موجود", "وضعیت موجودی"],
+    "short": ["short description", "توضیحات کوتاه"],
+    "desc": ["description", "توضیحات"],
+    "regular": ["regular price", "قیمت عادی"],
+    "sale": ["sale price", "قیمت فروش ویژه", "قیمت حراج"],
+    "cats": ["categories", "دسته‌ها", "دسته ها", "دسته‌بندی‌ها", "دسته بندی ها"],
+    "images": ["images", "تصاویر", "تصویر"],
+    "link": ["permalink", "پیوند یکتا", "لینک"],
+}
 
+def _norm(h):
+    return (h or "").replace("ي", "ی").replace("ك", "ک").replace("\u200c", " ").strip().lower().replace("  ", " ")
 
-def remove_by_input(text):
-    """حذف (غیرفعال‌سازی) با لینک، شناسه‌ی عددی یا بخشی از نام."""
-    text = text.strip()
-    links = find_links(text)
-    if links:
-        try:
-            pid = fetch_product_from_link(links[0])["id"]
-        except Exception as e:
-            return f"❌ {e}"
-    elif text.isdigit():
-        pid = int(text)
-    else:
-        r = sb("GET", "products", {"select": "id,title", "title": f"ilike.*{text}*", "active": "eq.true", "limit": 6})
-        found = r.json() if r.ok else []
-        if not found:
-            return "محصولی با این نام پیدا نشد."
-        if len(found) > 1:
-            return "چند محصول پیدا شد، شناسه‌ی عددی یکی را بفرستید:\n" + "\n".join(f"{x['id']} — {x['title']}" for x in found)
-        pid = found[0]["id"]
-    r = sb("PATCH", "products", {"id": f"eq.{pid}"}, {"active": False}, "return=representation")
-    done = r.json() if r.ok else []
-    return f"🗑 از چرخه خارج شد: {done[0]['title']}" if done else "این محصول در دیتابیس نبود."
-
+def import_csv(data: bytes):
+    text = data.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    cols = {}
+    for h in (reader.fieldnames or []):
+        for key, names in _ALIASES.items():
+            if key not in cols and _norm(h) in [_norm(n) for n in names]:
+                cols[key] = h
+    for need in ("id", "name", "images"):
+        if need not in cols:
+            raise RuntimeError("ستون «%s» در فایل پیدا نشد. ستون‌های فایل: %s" % (need, " | ".join(reader.fieldnames or [])[:300]))
+    g = lambda row, k: (row.get(cols[k]) or "").strip() if k in cols else ""
+    rows, skipped = [], 0
+    for i, row in enumerate(reader, 1):
+        if g(row, "type").lower() in ("variation", "تنوع"):
+            skipped += 1
+            continue
+        pid = g(row, "id")
+        if not pid.isdigit() or not g(row, "name"):
+            skipped += 1
+            continue
+        if "published" in cols and g(row, "published") not in ("1", ""):
+            skipped += 1                                   # پیش‌نویس/خصوصی
+            continue
+        img = (re.split(r"[,\n]\s*", g(row, "images")) or [""])[0].strip()
+        stock = g(row, "instock")
+        cats = [c.split(">")[-1].strip() for c in g(row, "cats").split(",") if c.strip()][:3]
+        rows.append({
+            "id": int(pid), "title": strip_html(g(row, "name")),
+            "url": g(row, "link") or f"{SITE_URL}/?p={pid}",
+            "image_url": img or None,
+            "price": fmt_num_price(g(row, "sale") or g(row, "regular")),
+            "short_desc": strip_html(g(row, "short"))[:600],
+            "description": strip_html(g(row, "desc"))[:900],
+            "categories": cats, "sort_order": i,
+            "active": stock not in ("0", "outofstock", "ناموجود"),
+        })
+    if not rows:
+        raise RuntimeError("هیچ محصولی در فایل پیدا نشد")
+    upsert_rows(rows)
+    no_img = sum(1 for r in rows if not r["image_url"])
+    return len(rows), skipped, no_img
 
 # ------------------------- انتخاب محصول بعدی (چرخه) -------------------------
 def pick_product():
@@ -293,48 +211,36 @@ def pick_product():
     items = [p for p in items if p.get("image_url")]
     if not items:
         return None
-    min_count = min(p["posted_count"] for p in items)      # فقط از کم‌پستی‌ها => چرخه‌ی بدون تکرار
+    min_count = min(p["posted_count"] for p in items)      # فقط از کم‌پستی‌ها انتخاب می‌شود => چرخه‌ی بدون تکرار
     pool = [p for p in items if p["posted_count"] == min_count]
     if ORDER_MODE == "sequential":
         return min(pool, key=lambda p: p["sort_order"])
     return random.choice(pool)
 
-
 # ------------------------- Gemini -------------------------
 _key_idx = 0
-
-
 def gemini_text(prompt):
     global _key_idx
     if not GEMINI_KEYS:
         return None
     n = len(GEMINI_KEYS)
-    cfg = {"temperature": 1.0, "maxOutputTokens": 1024}
-    if "2.5-flash" in GEMINI_MODEL:
-        cfg["thinkingConfig"] = {"thinkingBudget": 0}       # بدون «فکر کردن» تا سهمیه‌ی توکن متن را نخورد
-    for attempt in range(max(GEMINI_MAX_ATTEMPTS, 1)):
-        key_no = (_key_idx + attempt) % n
+    for i in range(n):
+        key = GEMINI_KEYS[(_key_idx + i) % n]
         try:
             r = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-                headers={"x-goog-api-key": GEMINI_KEYS[key_no], "Content-Type": "application/json"},
-                json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg},
+                headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                json={"contents": [{"parts": [{"text": prompt}]}],
+                      "generationConfig": {"temperature": 1.0, "maxOutputTokens": 400}},
                 timeout=40)
             if r.status_code == 200:
-                cands = r.json().get("candidates") or [{}]
-                parts = (cands[0].get("content") or {}).get("parts") or []
-                txt = "".join(p.get("text", "") for p in parts).strip()
-                if txt:
-                    _key_idx = (key_no + 1) % n         # کلید بعدی برای نوبت بعد
-                    return txt
-                log.warning("gemini key#%d -> پاسخ خالی", key_no)
-            else:
-                log.warning("gemini key#%d -> HTTP %s", key_no, r.status_code)
+                _key_idx = (_key_idx + i + 1) % n       # کلید بعدی برای نوبت بعد
+                parts = r.json()["candidates"][0]["content"]["parts"]
+                return "".join(p.get("text", "") for p in parts).strip()
+            log.warning("gemini key#%d -> HTTP %s", (_key_idx + i) % n, r.status_code)
         except Exception as e:
             log.warning("gemini error: %s", e)
-        time.sleep(1)
     return None
-
 
 def ai_body(p):
     prompt = f"""تو کپی‌رایتر کانال فروشگاه «شهر سفال» (سفال، سرامیک، گلدان، دکوری) هستی.
@@ -357,7 +263,6 @@ def ai_body(p):
     txt = re.sub(r"[*`\[\]]", "", txt).strip()
     return txt[:350]
 
-
 def build_caption(p):
     lines = [f"✅ {p['title']}", "", ai_body(p), ""]
     if SHOW_PRICE and p.get("price"):
@@ -373,13 +278,11 @@ def build_caption(p):
         lines += ["", tags]
     return "\n".join(lines)[:1000]
 
-
 def build_keyboard(p):
     rows = [[{"text": "مشاهده در سایت", "url": p["url"]}]]
     if ADMIN_USERNAME:
         rows.append([{"text": "ارسال پیام", "url": f"https://ble.ir/{ADMIN_USERNAME}"}])
     return {"inline_keyboard": rows}
-
 
 # ------------------------- ارسال به بله -------------------------
 def prepare_image(url):
@@ -395,7 +298,6 @@ def prepare_image(url):
         return buf.getvalue()
     except Exception:
         return r.content
-
 
 def bale_send_post(p, caption):
     kb = json.dumps(build_keyboard(p), ensure_ascii=False)
@@ -418,16 +320,11 @@ def bale_send_post(p, caption):
         log.error("sendMessage هم خطا داد: %s", r.text[:300])
     return ok
 
-
-def bale_msg(chat_id, text, keyboard=None):
-    payload = {"chat_id": chat_id, "text": text}
-    if keyboard:
-        payload["reply_markup"] = keyboard
+def bale_msg(chat_id, text):
     try:
-        requests.post(f"{BALE_API}/sendMessage", json=payload, timeout=20)
+        requests.post(f"{BALE_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=20)
     except Exception as e:
         log.warning("bale_msg: %s", e)
-
 
 # ------------------------- ارسال یک اسلات -------------------------
 def do_post(slot_key):
@@ -440,21 +337,16 @@ def do_post(slot_key):
         return "خطای دیتابیس"
     p = pick_product()
     if not p:
-        sb("DELETE", "post_slots", {"slot": f"eq.{slot_key}"})
         return "محصول آماده‌ای نیست"
     if bale_send_post(p, build_caption(p)):
         sb("PATCH", "products", {"id": f"eq.{p['id']}"},
-           {"posted_count": p["posted_count"] + 1, "last_posted_at": utcnow()})
+           {"posted_count": p["posted_count"] + 1, "last_posted_at": datetime.utcnow().isoformat() + "Z"})
         sb("PATCH", "post_slots", {"slot": f"eq.{slot_key}"}, {"product_id": p["id"]})
         return f"ارسال شد: {p['title']}"
     sb("DELETE", "post_slots", {"slot": f"eq.{slot_key}"})   # اسلات آزاد شود تا دوباره تلاش شود
     return "ارسال ناموفق"
 
-
 # ------------------------- زمان‌بند (ترد پس‌زمینه) -------------------------
-_retry_after = {}
-
-
 def scheduler_loop():
     time.sleep(5)
     while True:
@@ -464,138 +356,122 @@ def scheduler_loop():
                 hh, mm = map(int, t.split(":"))
                 due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
                 if due <= now <= due + timedelta(minutes=CATCHUP_MINUTES):
-                    slot = f"{now:%Y-%m-%d}_{t}"
-                    if _retry_after.get(slot, 0) > time.time():
-                        continue
-                    res = do_post(slot)
+                    res = do_post(f"{now:%Y-%m-%d}_{t}")
                     if res != "قبلاً انجام شده":
                         log.info("اسلات %s: %s", t, res)
-                    if res in ("ارسال ناموفق", "خطای دیتابیس", "محصول آماده‌ای نیست"):
-                        _retry_after[slot] = time.time() + 600      # ۱۰ دقیقه بعد دوباره
         except Exception as e:
             log.exception("scheduler: %s", e)
         time.sleep(60)
 
-
 # ------------------------- پنل ادمین در بله -------------------------
 MENU = {"inline_keyboard": [
     [{"text": "➕ افزودن محصول (با لینک)", "callback_data": "add"}],
-    [{"text": "📥 وارد کردن فایل محصولات", "callback_data": "csv"}],
-    [{"text": "📤 پست فوری", "callback_data": "post"}, {"text": "📊 وضعیت", "callback_data": "status"}],
-    [{"text": "🗑 حذف محصول از چرخه", "callback_data": "remove"}],
+    [{"text": "📥 ورود فایل CSV محصولات", "callback_data": "csv"}],
+    [{"text": "📊 وضعیت چرخه", "callback_data": "status"}, {"text": "📤 ارسال فوری", "callback_data": "post"}],
 ]}
-
+_waiting = {}   # user_id -> "add" | "csv"
 
 def status_text():
-    items = sb("GET", "products", {"select": "posted_count,image_url", "active": "eq.true"}).json()
+    items = sb("GET", "products", {"select": "posted_count", "active": "eq.true"}).json()
     if not items:
-        return "محصولی در دیتابیس نیست. فایل CSV محصولات را برای ربات بفرستید."
+        return "هنوز محصولی در دیتابیس نیست. فایل CSV را وارد کنید یا لینک محصول بفرستید."
     mn = min(i["posted_count"] for i in items)
     left = sum(1 for i in items if i["posted_count"] == mn)
-    noimg = sum(1 for i in items if not i.get("image_url"))
-    s = (f"📊 محصولات فعال: {len(items)}\nدور فعلی چرخه: {mn + 1}\n"
-         f"باقی‌مانده تا پایان این دور: {left}\nساعت‌های پست: {', '.join(POST_TIMES)}")
-    if noimg:
-        s += f"\n⚠️ بدون عکس: {noimg}"
-    return s
+    return (f"محصولات فعال: {len(items)}\nدور فعلی چرخه: {mn + 1}\n"
+            f"باقی‌مانده تا پایان این دور: {left}\nساعت‌های پست: {', '.join(POST_TIMES)}")
 
+def bale_menu(chat, text="چه کاری انجام بدم؟"):
+    try:
+        requests.post(f"{BALE_API}/sendMessage",
+                      json={"chat_id": chat, "text": text, "reply_markup": MENU}, timeout=20)
+    except Exception as e:
+        log.warning("menu: %s", e)
 
-def download_bale_file(file_id):
-    r = requests.get(f"{BALE_API}/getFile", params={"file_id": file_id}, timeout=30).json()
-    if not r.get("ok"):
-        raise RuntimeError(f"getFile خطا داد: {r}")
-    path = r["result"]["file_path"]
-    d = requests.get(f"{BALE_FILE}/{path}", timeout=90)
-    d.raise_for_status()
-    return d.content
+def add_links(chat, text):
+    links = re.findall(r"https?://[^\s]+", text)[:20]
+    if not links:
+        bale_msg(chat, "لینکی پیدا نشد. لینک کامل محصول را بفرستید.")
+        return
+    for link in links:
+        try:
+            row = fetch_by_link(link)
+            upsert_rows([row])
+            warn = "" if row.get("image_url") else "\n⚠️ عکس ندارد و پست نمی‌شود تا عکس اضافه کنید."
+            state = "" if row["active"] else "\n⚠️ در سایت ناموجود است و غیرفعال ثبت شد."
+            bale_msg(chat, f"✅ اضافه شد: {row['title']}{warn}{state}")
+        except Exception as e:
+            bale_msg(chat, f"❌ ناموفق: {link}\n{e}")
+        time.sleep(1)
 
+def set_active(chat, text, flag):
+    links = re.findall(r"https?://[^\s]+", text)
+    if not links:
+        bale_msg(chat, "لینک محصول را کنار دستور بنویسید.")
+        return
+    row = fetch_by_link(links[0])
+    sb("PATCH", "products", {"id": f"eq.{row['id']}"}, {"active": flag})
+    bale_msg(chat, f"{'✅ فعال شد' if flag else '⏸️ از چرخه خارج شد'}: {row['title']}")
 
-def handle_action(chat, uid, action):
-    if action == "add":
-        kv_set(f"state_{uid}", "add")
-        bale_msg(chat, "🔗 لینک محصول را بفرستید (چند لینک را هم می‌توانید در یک پیام بفرستید).\nبرای لغو: /cancel")
-    elif action == "csv":
-        bale_msg(chat, "📥 فایل CSV خروجی محصولات ووکامرس را همین‌جا به‌صورت فایل (Document) بفرستید.\n"
-                       "محصولات تکراری فقط به‌روز می‌شوند و شمارنده‌ی پستشان صفر نمی‌شود.")
-    elif action == "remove":
-        kv_set(f"state_{uid}", "remove")
-        bale_msg(chat, "🗑 لینک محصول، شناسه‌ی عددی یا بخشی از نام آن را بفرستید.\nبرای لغو: /cancel")
-    elif action == "status":
-        bale_msg(chat, status_text(), MENU)
-    elif action == "post":
-        bale_msg(chat, do_post(f"manual_{int(time.time())}"), MENU)
-    elif action == "menu":
-        bale_msg(chat, "منوی مدیریت:", MENU)
+def handle_csv(chat, doc):
+    try:
+        fi = requests.get(f"{BALE_API}/getFile", params={"file_id": doc["file_id"]}, timeout=30).json()
+        path = fi["result"]["file_path"]
+        data = requests.get(f"https://tapi.bale.ai/file/bot{BALE_TOKEN}/{path}", timeout=60).content
+        n, skipped, no_img = import_csv(data)
+        msg = f"✅ {n} محصول وارد/به‌روز شد. ({skipped} ردیف نادیده گرفته شد)"
+        if no_img:
+            msg += f"\n⚠️ {no_img} محصول بدون عکس‌اند و پست نمی‌شوند."
+        bale_msg(chat, msg)
+    except Exception as e:
+        bale_msg(chat, f"❌ خطا در ورود فایل: {e}")
 
+def handle_callback(cb):
+    uid, data = cb["from"]["id"], cb.get("data")
+    chat = cb["message"]["chat"]["id"]
+    requests.post(f"{BALE_API}/answerCallbackQuery", json={"callback_query_id": cb["id"]}, timeout=15)
+    if uid not in ADMIN_USER_IDS:
+        return
+    if data == "add":
+        _waiting[uid] = "add"
+        bale_msg(chat, "لینک محصول را بفرستید (می‌توانید چند لینک را زیر هم بفرستید).")
+    elif data == "csv":
+        _waiting[uid] = "csv"
+        bale_msg(chat, "فایل CSV خروجی محصولات را به‌صورت فایل (Document) بفرستید.")
+    elif data == "status":
+        bale_msg(chat, status_text())
+    elif data == "post":
+        bale_msg(chat, do_post(f"manual_{int(time.time())}"))
 
 def handle_message(m):
     uid = (m.get("from") or {}).get("id")
     chat = m["chat"]["id"]
     text = (m.get("text") or "").strip()
-    if text.lower().startswith("/myid"):                   # برای پیدا کردن شناسه‌ی عددی خودتان (مقدار ADMIN_ID)
+    if text.split(" ")[0].lower() == "/myid":
         bale_msg(chat, f"شناسه‌ی عددی شما: {uid}")
         return
-    if uid not in ADMIN_IDS:
+    if uid not in ADMIN_USER_IDS:
         return
-
-    # فایل CSV
-    doc = m.get("document")
-    if doc:
-        name = (doc.get("file_name") or "").lower()
-        if not name.endswith(".csv"):
-            bale_msg(chat, "فقط فایل CSV پذیرفته می‌شود. در پنل ووکامرس: محصولات > خروجی گرفتن (Export) و فرمت CSV.")
-            return
-        bale_msg(chat, "⏳ در حال خواندن فایل...")
+    if m.get("document"):
+        if _waiting.pop(uid, None) == "csv" or (m["document"].get("file_name") or "").lower().endswith(".csv"):
+            handle_csv(chat, m["document"])
+        return
+    cmd = text.split(" ")[0].lower()
+    if cmd in ("/start", "/menu", "/help"):
+        bale_menu(chat)
+    elif cmd == "/status":
+        bale_msg(chat, status_text())
+    elif cmd == "/post":
+        bale_msg(chat, do_post(f"manual_{int(time.time())}"))
+    elif cmd in ("/off", "/on"):
         try:
-            bale_msg(chat, import_csv_bytes(download_bale_file(doc["file_id"])), MENU)
+            set_active(chat, text, cmd == "/on")
         except Exception as e:
-            log.exception("import")
-            bale_msg(chat, f"❌ خطا در وارد کردن فایل: {e}")
-        return
-
-    if not text:
-        return
-    cmd = text.split()[0].lower() if text.startswith("/") else None
-    if cmd in ("/start", "/help", "/menu"):
-        handle_action(chat, uid, "menu")
-    elif cmd == "/cancel":
-        kv_del(f"state_{uid}")
-        bale_msg(chat, "لغو شد.", MENU)
-    elif cmd in ("/status", "/post", "/add", "/remove"):
-        handle_action(chat, uid, cmd[1:])
-    elif cmd:
-        handle_action(chat, uid, "menu")
-    else:
-        state = kv_get(f"state_{uid}")
-        links = find_links(text)
-        if state == "remove":
-            kv_del(f"state_{uid}")
-            bale_msg(chat, remove_by_input(text), MENU)
-        elif links:                                        # لینک بفرستید، با دکمه یا بدون دکمه، اضافه می‌شود
-            kv_del(f"state_{uid}")
-            bale_msg(chat, "⏳ در حال افزودن...")
-            bale_msg(chat, add_from_links(links), MENU)
-        elif state == "add":
-            bale_msg(chat, "لینکی از سایت پیدا نشد. لینک کامل محصول را بفرستید یا /cancel بزنید.")
-        else:
-            handle_action(chat, uid, "menu")
-
-
-def handle_callback(cb):
-    uid = (cb.get("from") or {}).get("id")
-    try:
-        requests.post(f"{BALE_API}/answerCallbackQuery", json={"callback_query_id": cb["id"]}, timeout=10)
-    except Exception:
-        pass
-    if uid not in ADMIN_IDS:
-        return
-    chat = (cb.get("message") or {}).get("chat", {}).get("id") or uid
-    handle_action(chat, uid, cb.get("data", ""))
-
+            bale_msg(chat, f"❌ {e}")
+    elif _waiting.get(uid) == "add" or SITE_URL.split("//")[-1] in text:
+        _waiting.pop(uid, None)
+        add_links(chat, text)
 
 def poll_loop():
-    if not ADMIN_IDS:
-        log.warning("ADMIN_ID تنظیم نشده؛ پنل ادمین غیرفعال است (پست‌گذاری زمان‌بندی‌شده کار می‌کند).")
     try:
         requests.post(f"{BALE_API}/deleteWebhook", timeout=15)
     except Exception:
@@ -611,30 +487,24 @@ def poll_loop():
                         handle_callback(u["callback_query"])
                     elif u.get("message"):
                         handle_message(u["message"])
-                except Exception:
-                    log.exception("handler")
+                except Exception as e:
+                    log.warning("handler: %s", e)
         except Exception as e:
             log.warning("poll: %s", e)
             time.sleep(5)
 
-
 # ------------------------- وب‌سرور (برای UptimeRobot) -------------------------
 app = Flask(__name__)
-
 
 @app.get("/")
 def home():
     return "ok"
 
-
 @app.get("/health")
 def health():
     return jsonify(status="up", time=datetime.now(TZ).isoformat())
 
-
 _started = False
-
-
 def start_background():
     global _started
     if _started:
@@ -642,7 +512,6 @@ def start_background():
     _started = True
     threading.Thread(target=scheduler_loop, daemon=True).start()
     threading.Thread(target=poll_loop, daemon=True).start()
-
 
 start_background()
 
