@@ -5,6 +5,8 @@
 - مقصدها: بله، تلگرام و روبیکا (هرکدام که توکن و مقصدش تنظیم شود)، همه با یک متن و یک محصول در هر اسلات
 - متن پست: Gemini با چرخش بین چند کلید
 """
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -14,7 +16,7 @@ import re
 import threading
 import time
 import zlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html import unescape
 from urllib.parse import urlparse, unquote
 from zoneinfo import ZoneInfo
@@ -46,9 +48,40 @@ RUBIKA_LINK_BUTTON = env("RUBIKA_LINK_BUTTON", "false").lower() == "true"
 ORDER_MODE = env("ORDER_MODE", "random")               # random | sequential
 CATCHUP_MINUTES = int(env("CATCHUP_MINUTES", "180"))   # اگر سرور خواب بود تا چند دقیقه دیرتر هم پست بزند
 TZ = ZoneInfo(env("TZ_NAME", "Asia/Tehran"))
-BALE_API = f"https://tapi.bale.ai/bot{BALE_TOKEN}"
 UA = {"User-Agent": "Mozilla/5.0 (compatible; CitySofalBot/1.0)"}
 T = "products"                                         # نام جدول محصولات
+
+# توکن‌ها و کلیدها هرگز در لاگ دیده نشوند (پیام خطای requests شامل آدرس با توکن است)
+_SECRETS = [x for x in (BALE_TOKEN, env("TELEGRAM_TOKEN"), env("RUBIKA_TOKEN"), SB_KEY, env("SETUP_KEY"), *GEMINI_KEYS)
+            if x and len(x) >= 6]
+
+class _Redact(logging.Filter):
+    @staticmethod
+    def _scrub(text):
+        for x in _SECRETS:
+            text = text.replace(x, "***")
+        return text
+    def filter(self, record):
+        record.msg, record.args = self._scrub(record.getMessage()), ()
+        if record.exc_info:
+            record.exc_text = self._scrub(logging.Formatter().formatException(record.exc_info))
+            record.exc_info = None
+        return True
+
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_Redact())
+
+def _valid_time(t):
+    try:
+        hh, mm = map(int, t.split(":"))
+        return 0 <= hh < 24 and 0 <= mm < 60
+    except Exception:
+        return False
+
+_bad = [t for t in POST_TIMES if not _valid_time(t)]
+if _bad:
+    log.error("ساعت نامعتبر در POST_TIMES نادیده گرفته شد: %s (قالب درست: 10:00)", _bad)
+POST_TIMES = [t for t in POST_TIMES if _valid_time(t)]
 
 STYLE_HINTS = [
     "لحن گرم و صمیمی، تأکید بر زیبایی و حس خانه",
@@ -71,11 +104,31 @@ def strip_html(s):
     s = re.sub(r"<[^>]+>", " ", s or "")
     return re.sub(r"\s+", " ", unescape(s)).strip()
 
+def parse_product_link(link):
+    """لینک باید از همین سایت و به شکل /product/نام-محصول/ باشد؛ برمی‌گرداند (لینک تمیز، slug)."""
+    link = link.strip().rstrip(".,)»،؛؟!")
+    u = urlparse(link)
+    strip_www = lambda h: h.lower().removeprefix("www.")
+    if strip_www(u.netloc) != strip_www(urlparse(SITE_URL).netloc):
+        raise RuntimeError("لینک باید از سایت فروشگاه باشد")
+    parts = [x for x in u.path.split("/") if x]
+    if len(parts) < 2 or parts[-2] != "product":
+        raise RuntimeError("این لینک، لینک یک محصول نیست (باید شکل /product/نام-محصول/ باشد)")
+    return link, unquote(parts[-1])
+
+def find_in_db(link):
+    """محصول را بدون درخواست به سایت از دیتابیس پیدا می‌کند (با slug یا permalink)."""
+    link, slug = parse_product_link(link)
+    for col, val in (("slug", slug), ("permalink", link), ("permalink", link.rstrip("/") + "/")):
+        r = sb("GET", T, {col: f"eq.{val}", "select": "*", "limit": 1})
+        if r.ok and r.json():
+            return r.json()[0]
+    return None
+
 def fetch_by_link(link):
-    """فقط همان یک محصول را از سایت می‌گیرد (۱ درخواست سبک)."""
-    link = link.strip().rstrip(".,)»")
-    slug = unquote(urlparse(link).path.strip("/").split("/")[-1])
-    if slug:
+    """اول از API سایت (۱ درخواست سبک)، اگر نشد از دیتابیس، آخرین راه تگ‌های og صفحه."""
+    link, slug = parse_product_link(link)
+    try:
         r = requests.get(f"{SITE_URL}/wp-json/wc/store/v1/products",
                          params={"slug": slug}, headers=UA, timeout=30)
         if r.status_code == 200 and r.json():
@@ -85,7 +138,11 @@ def fetch_by_link(link):
                     "permalink": p.get("permalink") or link,
                     "image_url": imgs[0]["src"] if imgs else None,
                     "active": bool(p.get("is_in_stock", True))}
-    # فالبک: خواندن تگ‌های og از خود صفحه
+    except Exception as e:
+        log.warning("Store API در دسترس نیست: %s", e)
+    row = find_in_db(link)               # جلوگیری از ساخت ردیف تکراری با شناسه‌ی جعلی
+    if row:
+        return {k: row.get(k) for k in ("product_id", "name", "slug", "permalink", "image_url", "active")}
     r = requests.get(link, headers=UA, timeout=30)
     r.raise_for_status()
     def og(name):
@@ -145,7 +202,7 @@ def gemini_text(prompt):
                                   json=body, timeout=40)
                 if r.status_code == 200:
                     parts = r.json()["candidates"][0]["content"]["parts"]
-                    txt = "".join(p.get("text", "") for p in parts).strip()
+                    txt = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
                     if txt:
                         _key_ep[idx] = e
                         _key_idx = (idx + 1) % n           # کلید بعدی برای نوبت بعد
@@ -157,24 +214,41 @@ def gemini_text(prompt):
                 log.warning("gemini key#%d ep%d error: %s", idx, e, ex)
     return None
 
+FALLBACK_BODY = "یک انتخاب زیبا برای خانه‌ی شما ✨\nجزئیات و تصاویر بیشتر را در سایت ببینید."
+
+def clean_ai_text(raw):
+    """فقط متن بین <<< و >>> قبول می‌شود؛ هر چیز دیگر (فکر کردن مدل، توضیح، انگلیسی) دور ریخته می‌شود."""
+    m = re.search(r"<<<(.*?)>>>", raw or "", re.S)
+    if not m:
+        return None
+    txt = re.sub(r"[*`\[\]<>#]", "", m.group(1)).strip()
+    letters = re.findall(r"[A-Za-z\u0600-\u06FF]", txt)
+    persian = re.findall(r"[\u0600-\u06FF]", txt)
+    if len(txt) < 15 or not letters or len(persian) / len(letters) < 0.85:   # بیش از ۱۵٪ حروف لاتین = مشکوک
+        return None
+    return txt[:350]
+
 def ai_body(p):
     prompt = f"""تو کپی‌رایتر کانال فروشگاه «شهر سفال» (سفال، سرامیک، گلدان، دکوری) هستی.
 برای محصول زیر یک متن کوتاه فارسی برای پست کانال بنویس.
 
 قوانین:
 - ۲ تا ۳ خط کوتاه، حداکثر ۲۵۰ کاراکتر، لحن: {random.choice(STYLE_HINTS)}
-- فقط از اطلاعات زیر استفاده کن؛ ابعاد، جنس، ضمانت یا ویژگی‌ای که از نام محصول معلوم نیست را اختراع نکن.
+- فقط به زبان فارسی بنویس؛ هیچ کلمه‌ی انگلیسی ننویس.
+- فقط از اطلاعات زیر استفاده کن؛ ابعاد، جنس، ضمانت، تضمین یا ویژگی‌ای که از نام محصول معلوم نیست را ننویس.
 - قیمت، شماره تماس، لینک و هشتگ ننویس.
 - از ستاره، کروشه و بک‌تیک استفاده نکن. حداکثر ۲ ایموجی مرتبط.
-- با «سلام» یا «به نظر من» شروع نکن. فقط خود متن را بده، بدون توضیح اضافه.
+- با «سلام» یا «به نظر من» شروع نکن.
+- استدلال، توضیح و پیش‌نویس ننویس. فقط متن نهایی پست را بین <<< و >>> بگذار، مثل: <<<متن پست>>>
 
 نام محصول: {p['name']}
 نام انگلیسی (از آدرس، فقط برای درک بهتر): {(p.get('slug') or '').replace('-', ' ')}"""
-    txt = gemini_text(prompt)
-    if not txt:
-        return "یک انتخاب زیبا برای خانه‌ی شما ✨\nجزئیات و تصاویر بیشتر را در سایت ببینید."
-    txt = re.sub(r"[*`\[\]]", "", txt).strip()
-    return txt[:350]
+    for _ in range(2):                    # دو تلاش (کلید بعدی)، بعد متن پیش‌فرض
+        txt = clean_ai_text(gemini_text(prompt))
+        if txt:
+            return txt
+        log.warning("خروجی Gemini نامعتبر بود؛ دوباره تلاش می‌شود")
+    return FALLBACK_BODY
 
 def build_caption(p, body, plat):
     lines = [f"✅ {p['name']}", "", body, "", "🌐 برای مشاهده قیمت و سفارش وارد سایت شوید"]
@@ -327,6 +401,9 @@ class Telegram(TgLike):
 class Rubika(Platform):
     """روبیکا: ارسال = requestSendFile -> آپلود -> sendFile. پنل ادمین با دکمه‌های پایین چت (ChatKeypad) و getUpdates."""
     name = "rubika"
+    def __init__(self, *a):
+        super().__init__(*a)
+        self._seen = {}                       # آپدیت‌های پردازش‌شده (ضد اجرای تکراری)
     def _call(self, method, payload):
         r = requests.post(f"https://botapi.rubika.ir/v3/{self.token}/{method}", json=payload, timeout=40)
         return r.json()
@@ -378,6 +455,12 @@ class Rubika(Platform):
         except Exception as e:
             log.warning("rubika menu: %s", e)
     def _process(self, u, handler):
+        h = hashlib.md5(json.dumps(u, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        if h in self._seen:
+            return
+        self._seen[h] = 1
+        if len(self._seen) > 2000:
+            self._seen.pop(next(iter(self._seen)))
         t, chat = u.get("type"), u.get("chat_id")
         if t == "StartedBot":
             handler(self, "message", chat, chat, "/start")
@@ -454,14 +537,8 @@ def build_platforms():
 ALL_PLATFORMS = build_platforms()                       # برای پنل ادمین (توکن دارند)
 PLATFORMS = [p for p in ALL_PLATFORMS if p.target]      # برای پست‌گذاری (مقصد دارند)
 
-def bale_msg(chat_id, text):
-    try:
-        requests.post(f"{BALE_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=20)
-    except Exception as e:
-        log.warning("bale_msg: %s", e)
-
 # ------------------------- ارسال یک اسلات (همه‌ی پلتفرم‌ها با هم) -------------------------
-def do_post(slot_key):
+def _do_post(slot_key):
     """اسلات را قفل می‌کند (ضد پست دوبل)، یک محصول انتخاب می‌کند و به همه‌ی پلتفرم‌های فعال می‌فرستد."""
     if not PLATFORMS:
         return "هیچ پلتفرمی فعال نیست (توکن و مقصد را تنظیم کنید)"
@@ -490,12 +567,29 @@ def do_post(slot_key):
             results[plat.name] = False
     summary = " ".join(f"{k}:{'✅' if v else '❌'}" for k, v in results.items())
     if any(results.values()):
-        sb("PATCH", T, {"product_id": f"eq.{p['product_id']}"},
-           {"posted_count": p["posted_count"] + 1, "last_posted_at": datetime.utcnow().isoformat() + "Z"})
-        sb("PATCH", "post_slots", {"slot": f"eq.{slot_key}"}, {"product_id": p["product_id"]})
+        try:   # بعد از ارسال موفق، خطای دیتابیس نباید باعث ارسال دوباره شود
+            sb("PATCH", T, {"product_id": f"eq.{p['product_id']}"},
+               {"posted_count": p["posted_count"] + 1, "last_posted_at": datetime.now(timezone.utc).isoformat()})
+            sb("PATCH", "post_slots", {"slot": f"eq.{slot_key}"}, {"product_id": p["product_id"]})
+        except Exception as e:
+            log.error("ثبت نتیجه در دیتابیس ناموفق (پست ارسال شده): %s", e)
         return f"ارسال شد: {p['name']}\n{summary}"
     sb("DELETE", "post_slots", {"slot": f"eq.{slot_key}"})   # اسلات آزاد شود تا دوباره تلاش شود
     return f"ارسال ناموفق ({summary})"
+
+_post_lock = threading.Lock()   # پست دستی و زمان‌بندی هم‌زمان یک محصول را دوبار انتخاب نکنند
+
+def do_post(slot_key):
+    with _post_lock:
+        try:
+            return _do_post(slot_key)
+        except Exception as e:
+            log.exception("do_post: %s", e)
+            try:
+                sb("DELETE", "post_slots", {"slot": f"eq.{slot_key}"})   # اسلات سوخته نشود
+            except Exception:
+                pass
+            return "ارسال ناموفق (خطای داخلی)"
 
 # ------------------------- زمان‌بند (ترد پس‌زمینه) -------------------------
 _retry_after = {}
@@ -557,12 +651,12 @@ def set_active(plat, chat, text, flag):
     if not links:
         plat.send_text(chat, "لینک محصول را کنار دستور بنویسید.")
         return
-    row = fetch_by_link(links[0])
-    r = sb("PATCH", T, {"product_id": f"eq.{row['product_id']}"}, {"active": flag}, "return=representation")
-    if r.ok and r.json():
-        plat.send_text(chat, f"{'✅ فعال شد' if flag else '⏸️ از چرخه خارج شد'}: {row['name']}")
-    else:
+    row = find_in_db(links[0])
+    if not row:
         plat.send_text(chat, "این محصول در دیتابیس نیست؛ ابتدا با لینک اضافه‌اش کنید.")
+        return
+    sb("PATCH", T, {"product_id": f"eq.{row['product_id']}"}, {"active": flag})
+    plat.send_text(chat, f"{'✅ فعال شد' if flag else '⏸️ از چرخه خارج شد'}: {row['name']}")
 
 def run_action(plat, uid, chat, action):
     if action == "add":
@@ -627,7 +721,7 @@ def rubika_id():
     """صفحه‌ی موقت برای پیدا کردن chat_id روبیکا. فقط با SETUP_KEY کار می‌کند؛ بعد از استفاده SETUP_KEY را حذف کنید."""
     from flask import request, Response
     key = env("SETUP_KEY")
-    if not key or request.args.get("key") != key:
+    if not key or not hmac.compare_digest(request.args.get("key", ""), key):
         return "forbidden", 403
     tok = env("RUBIKA_TOKEN")
     if not tok:

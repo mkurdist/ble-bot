@@ -12,3 +12,7 @@ create table if not exists post_slots (
 create table if not exists kv (k text primary key, v text);
 alter table post_slots enable row level security;
 alter table kv enable row level security;
+
+-- اختیاری: فقط اگر هنگام «افزودن محصول جدید با لینک» خطای null روی mention_count گرفتید، این را اجرا کنید
+-- (فقط مقدار پیش‌فرض ستون را 0 می‌کند و روی داده‌ی فعلی اثری ندارد)
+-- alter table products alter column mention_count set default 0;
