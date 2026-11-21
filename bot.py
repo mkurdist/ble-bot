@@ -41,7 +41,6 @@ GEMINI_MODEL = env("GEMINI_MODEL", "gemini-2.5-flash")
 SITE_URL = env("SITE_URL", "https://citysofal.ir").rstrip("/")
 ADMIN_USERNAME = env("ADMIN_USERNAME", "").lstrip("@")
 ADMIN_PHONE = env("ADMIN_PHONE", "")
-ADMIN_USER_IDS = {int(x) for x in env("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()}
 POST_TIMES = [t.strip() for t in env("POST_TIMES", "10:00,13:00,16:00,19:00,21:00").split(",") if t.strip()]
 RUBIKA_LINK_BUTTON = env("RUBIKA_LINK_BUTTON", "false").lower() == "true"
 ORDER_MODE = env("ORDER_MODE", "random")               # random | sequential
@@ -122,27 +121,40 @@ def pick_product():
 
 # ------------------------- Gemini -------------------------
 _key_idx = 0
+GEMINI_ENDPOINTS = [   # کلیدهای AIza... روی اولی و کلیدهای AQ... (Vertex Express) روی دومی کار می‌کنند
+    "https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+    "https://aiplatform.googleapis.com/v1/publishers/google/models/{m}:generateContent",
+]
+_key_ep = {}   # شماره‌ی کلید -> آدرسی که برایش جواب داده
+
 def gemini_text(prompt):
     global _key_idx
     if not GEMINI_KEYS:
         return None
     n = len(GEMINI_KEYS)
+    body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 1.0, "maxOutputTokens": 1200}}
     for i in range(n):
-        key = GEMINI_KEYS[(_key_idx + i) % n]
-        try:
-            r = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-                headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-                json={"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"temperature": 1.0, "maxOutputTokens": 400}},
-                timeout=40)
-            if r.status_code == 200:
-                _key_idx = (_key_idx + i + 1) % n       # کلید بعدی برای نوبت بعد
-                parts = r.json()["candidates"][0]["content"]["parts"]
-                return "".join(p.get("text", "") for p in parts).strip()
-            log.warning("gemini key#%d -> HTTP %s", (_key_idx + i) % n, r.status_code)
-        except Exception as e:
-            log.warning("gemini error: %s", e)
+        idx = (_key_idx + i) % n
+        key = GEMINI_KEYS[idx]
+        eps = [_key_ep[idx]] if idx in _key_ep else range(len(GEMINI_ENDPOINTS))
+        for e in eps:
+            try:
+                r = requests.post(GEMINI_ENDPOINTS[e].format(m=GEMINI_MODEL),
+                                  headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                                  json=body, timeout=40)
+                if r.status_code == 200:
+                    parts = r.json()["candidates"][0]["content"]["parts"]
+                    txt = "".join(p.get("text", "") for p in parts).strip()
+                    if txt:
+                        _key_ep[idx] = e
+                        _key_idx = (idx + 1) % n           # کلید بعدی برای نوبت بعد
+                        return txt
+                log.warning("gemini key#%d ep%d -> HTTP %s %s", idx, e, r.status_code, r.text[:160].replace("\n", " "))
+                if r.status_code in (429, 500, 503):
+                    break                                    # این کلید فعلاً محدود است؛ کلید بعدی
+            except Exception as ex:
+                log.warning("gemini key#%d ep%d error: %s", idx, e, ex)
     return None
 
 def ai_body(p):
@@ -194,13 +206,25 @@ def prepare_image(url):
     except Exception:
         return r.content
 
+MENU_LABELS = {"add": "➕ افزودن محصول (با لینک)", "status": "📊 وضعیت چرخه", "post": "📤 ارسال فوری"}
+MENU_HELP = "چه کاری انجام بدم؟"
+START_TS = time.time()
+
 class Platform:
     name = ""
-    def __init__(self, token, target, admin):
-        self.token, self.target, self.admin = token, target, (admin or "").lstrip("@")
+    def __init__(self, token, target, admin, admins):
+        self.token, self.target = token, target
+        self.admin = (admin or "").lstrip("@")
+        self.admins = admins                      # مجموعه‌ی شناسه‌های ادمین (رشته)
     def admin_url(self):
         return None
     def send_post(self, p, caption, img):
+        raise NotImplementedError
+    def send_text(self, chat, text):
+        raise NotImplementedError
+    def send_menu(self, chat, text=MENU_HELP):
+        raise NotImplementedError
+    def poll(self, handler):
         raise NotImplementedError
 
 class TgLike(Platform):
@@ -224,13 +248,65 @@ class TgLike(Platform):
                 log.warning("%s sendPhoto خطا: %s", self.name, j)
             except Exception as e:
                 log.warning("%s sendPhoto exception: %s", self.name, e)
-        # فالبک: متن + لینک
         r = requests.post(f"{self.api}/sendMessage",
                           json={"chat_id": self.target, "text": f"{caption}\n\n🔗 {p['permalink']}"}, timeout=30)
         ok = r.json().get("ok", False)
         if not ok:
             log.error("%s sendMessage هم خطا داد: %s", self.name, r.text[:300])
         return ok
+    def send_text(self, chat, text):
+        try:
+            requests.post(f"{self.api}/sendMessage", json={"chat_id": chat, "text": text}, timeout=20)
+        except Exception as e:
+            log.warning("%s send_text: %s", self.name, e)
+    def send_menu(self, chat, text=MENU_HELP):
+        kb = {"inline_keyboard": [
+            [{"text": MENU_LABELS["add"], "callback_data": "add"}],
+            [{"text": MENU_LABELS["status"], "callback_data": "status"},
+             {"text": MENU_LABELS["post"], "callback_data": "post"}]]}
+        try:
+            requests.post(f"{self.api}/sendMessage", json={"chat_id": chat, "text": text, "reply_markup": kb}, timeout=20)
+        except Exception as e:
+            log.warning("%s menu: %s", self.name, e)
+    def _updates(self, offset, timeout):
+        r = requests.get(f"{self.api}/getUpdates", params={"offset": offset, "timeout": timeout}, timeout=timeout + 15)
+        return r.json().get("result", [])
+    def _process(self, u, handler):
+        if u.get("callback_query"):
+            cb = u["callback_query"]
+            try:
+                requests.post(f"{self.api}/answerCallbackQuery", json={"callback_query_id": cb["id"]}, timeout=15)
+            except Exception:
+                pass
+            handler(self, "button", cb["from"]["id"], cb["message"]["chat"]["id"], cb.get("data"))
+        elif u.get("message"):
+            m = u["message"]
+            handler(self, "message", (m.get("from") or {}).get("id"), m["chat"]["id"], m.get("text") or "")
+    def poll(self, handler):
+        try:
+            requests.post(f"{self.api}/deleteWebhook", timeout=15)
+        except Exception:
+            pass
+        offset = 0
+        try:                                   # پیام‌های قدیمیِ مانده در صف دوباره اجرا نشوند
+            for _ in range(30):
+                ups = self._updates(offset, 0)
+                if not ups:
+                    break
+                offset = ups[-1]["update_id"] + 1
+        except Exception as e:
+            log.warning("%s drain: %s", self.name, e)
+        while True:
+            try:
+                for u in self._updates(offset, 25):
+                    offset = u["update_id"] + 1
+                    try:
+                        self._process(u, handler)
+                    except Exception as e:
+                        log.warning("%s handler: %s", self.name, e)
+            except Exception as e:
+                log.warning("%s poll: %s", self.name, e)
+                time.sleep(5)
 
 class Bale(TgLike):
     name = "bale"
@@ -249,7 +325,7 @@ class Telegram(TgLike):
         return f"https://t.me/{self.admin}"
 
 class Rubika(Platform):
-    """روبیکا: requestSendFile -> آپلود -> sendFile با text. لینک همیشه داخل متن هم می‌آید."""
+    """روبیکا: ارسال = requestSendFile -> آپلود -> sendFile. پنل ادمین با دکمه‌های پایین چت (ChatKeypad) و getUpdates."""
     name = "rubika"
     def _call(self, method, payload):
         r = requests.post(f"https://botapi.rubika.ir/v3/{self.token}/{method}", json=payload, timeout=40)
@@ -274,7 +350,7 @@ class Rubika(Platform):
                     j = self._call("sendFile", payload)
                     if self._ok(j):
                         return True
-                    if RUBIKA_LINK_BUTTON:   # بدون دکمه دوباره تلاش کن
+                    if RUBIKA_LINK_BUTTON:
                         payload.pop("inline_keypad", None)
                         if self._ok(self._call("sendFile", payload)):
                             return True
@@ -285,20 +361,98 @@ class Rubika(Platform):
         if not self._ok(j):
             log.error("rubika sendMessage خطا: %s", j)
         return self._ok(j)
+    def send_text(self, chat, text):
+        try:
+            self._call("sendMessage", {"chat_id": chat, "text": text})
+        except Exception as e:
+            log.warning("rubika send_text: %s", e)
+    def send_menu(self, chat, text=MENU_HELP):
+        keypad = {"rows": [
+            {"buttons": [{"id": "add", "type": "Simple", "button_text": MENU_LABELS["add"]}]},
+            {"buttons": [{"id": "status", "type": "Simple", "button_text": MENU_LABELS["status"]},
+                         {"id": "post", "type": "Simple", "button_text": MENU_LABELS["post"]}]}],
+            "resize_keyboard": True, "one_time_keyboard": False}
+        try:
+            self._call("sendMessage", {"chat_id": chat, "text": text,
+                                       "chat_keypad": keypad, "chat_keypad_type": "New"})
+        except Exception as e:
+            log.warning("rubika menu: %s", e)
+    def _process(self, u, handler):
+        t, chat = u.get("type"), u.get("chat_id")
+        if t == "StartedBot":
+            handler(self, "message", chat, chat, "/start")
+            return
+        if t != "NewMessage":
+            return
+        nm = u.get("new_message") or {}
+        if nm.get("sender_type") != "User":          # پیام‌های خود بات را نادیده بگیر
+            return
+        try:
+            if int(nm.get("time") or 0) < START_TS - 30:   # پیام‌های قدیمی قبل از راه‌اندازی
+                return
+        except Exception:
+            pass
+        uid = nm.get("sender_id") or chat
+        text = (nm.get("text") or "").strip()
+        bid = (nm.get("aux_data") or {}).get("button_id")
+        by_label = {v: k for k, v in MENU_LABELS.items()}
+        if bid in MENU_LABELS:
+            handler(self, "button", uid, chat, bid)
+        elif text in by_label:
+            handler(self, "button", uid, chat, by_label[text])
+        else:
+            handler(self, "message", uid, chat, text)
+    def poll(self, handler):
+        offset = None
+        def fetch():
+            payload = {"limit": 50}
+            if offset:
+                payload["offset_id"] = offset
+            d = self._call("getUpdates", payload)
+            return d.get("data") or d
+        try:                                          # صف قدیمی را رد کن
+            for _ in range(20):
+                d = fetch()
+                if d.get("next_offset_id"):
+                    offset = d["next_offset_id"]
+                if not d.get("updates"):
+                    break
+        except Exception as e:
+            log.warning("rubika drain: %s", e)
+        while True:
+            try:
+                d = fetch()
+                for u in d.get("updates") or []:
+                    try:
+                        self._process(u, handler)
+                    except Exception as e:
+                        log.warning("rubika handler: %s", e)
+                if d.get("next_offset_id"):
+                    offset = d["next_offset_id"]
+            except Exception as e:
+                log.warning("rubika poll: %s", e)
+            time.sleep(3)
+
+def _ids(*keys):
+    s = set()
+    for k in keys:
+        for x in env(k, "").split(","):
+            if x.strip():
+                s.add(x.strip())
+    return s
 
 def build_platforms():
-    out = []
     def adm(key):
         return env(f"ADMIN_USERNAME_{key}", "") or ADMIN_USERNAME
-    if BALE_TARGET:
-        out.append(Bale(BALE_TOKEN, BALE_TARGET, adm("BALE")))
-    if env("TELEGRAM_TOKEN") and env("TELEGRAM_TARGET"):
-        out.append(Telegram(env("TELEGRAM_TOKEN"), env("TELEGRAM_TARGET"), adm("TELEGRAM")))
-    if env("RUBIKA_TOKEN") and env("RUBIKA_TARGET"):
-        out.append(Rubika(env("RUBIKA_TOKEN"), env("RUBIKA_TARGET"), adm("RUBIKA")))
+    out = [Bale(BALE_TOKEN, BALE_TARGET, adm("BALE"), _ids("ADMIN_USER_IDS_BALE", "ADMIN_USER_IDS"))]
+    if env("TELEGRAM_TOKEN"):
+        out.append(Telegram(env("TELEGRAM_TOKEN"), env("TELEGRAM_TARGET"), adm("TELEGRAM"), _ids("ADMIN_USER_IDS_TELEGRAM")))
+    if env("RUBIKA_TOKEN"):
+        out.append(Rubika(env("RUBIKA_TOKEN"), env("RUBIKA_TARGET"), adm("RUBIKA"), _ids("ADMIN_USER_IDS_RUBIKA")))
     return out
 
-PLATFORMS = build_platforms()
+ALL_PLATFORMS = build_platforms()                       # برای پنل ادمین (توکن دارند)
+PLATFORMS = [p for p in ALL_PLATFORMS if p.target]      # برای پست‌گذاری (مقصد دارند)
 
 def bale_msg(chat_id, text):
     try:
@@ -366,12 +520,8 @@ def scheduler_loop():
             log.exception("scheduler: %s", e)
         time.sleep(60)
 
-# ------------------------- پنل ادمین در بله -------------------------
-MENU = {"inline_keyboard": [
-    [{"text": "➕ افزودن محصول (با لینک)", "callback_data": "add"}],
-    [{"text": "📊 وضعیت چرخه", "callback_data": "status"}, {"text": "📤 ارسال فوری", "callback_data": "post"}],
-]}
-_waiting = {}   # user_id -> "add"
+# ------------------------- پنل ادمین (یکسان در بله / تلگرام / روبیکا) -------------------------
+_waiting = {}   # (پلتفرم, شناسه‌ی کاربر) -> "add"
 
 def status_text():
     r = sb("GET", T, {"select": "posted_count", "active": "eq.true"})
@@ -382,19 +532,12 @@ def status_text():
     left = sum(1 for i in items if i["posted_count"] == mn)
     return (f"محصولات فعال: {len(items)}\nدور فعلی چرخه: {mn + 1}\n"
             f"باقی‌مانده تا پایان این دور: {left}\nساعت‌های پست: {', '.join(POST_TIMES)}\n"
-            f"پلتفرم‌های فعال: {', '.join(x.name for x in PLATFORMS) or '-'}")
+            f"پست می‌شود در: {', '.join(x.name for x in PLATFORMS) or '-'}")
 
-def bale_menu(chat, text="چه کاری انجام بدم؟"):
-    try:
-        requests.post(f"{BALE_API}/sendMessage",
-                      json={"chat_id": chat, "text": text, "reply_markup": MENU}, timeout=20)
-    except Exception as e:
-        log.warning("menu: %s", e)
-
-def add_links(chat, text):
+def add_links(plat, chat, text):
     links = re.findall(r"https?://[^\s]+", text)[:20]
     if not links:
-        bale_msg(chat, "لینکی پیدا نشد. لینک کامل محصول را بفرستید.")
+        plat.send_text(chat, "لینکی پیدا نشد. لینک کامل محصول را بفرستید.")
         return
     for link in links:
         try:
@@ -404,83 +547,68 @@ def add_links(chat, text):
             upsert_rows([row])
             warn = "" if row.get("image_url") else "\n⚠️ عکس ندارد و پست نمی‌شود تا عکس اضافه شود."
             state = "" if row["active"] else "\n⚠️ در سایت ناموجود است و غیرفعال ثبت شد."
-            bale_msg(chat, f"{'🔄 قبلاً بود، به‌روز شد' if existed else '✅ اضافه شد'}: {row['name']}{warn}{state}")
+            plat.send_text(chat, f"{'🔄 قبلاً بود، به‌روز شد' if existed else '✅ اضافه شد'}: {row['name']}{warn}{state}")
         except Exception as e:
-            bale_msg(chat, f"❌ ناموفق: {link}\n{e}")
+            plat.send_text(chat, f"❌ ناموفق: {link}\n{e}")
         time.sleep(1)
 
-def set_active(chat, text, flag):
+def set_active(plat, chat, text, flag):
     links = re.findall(r"https?://[^\s]+", text)
     if not links:
-        bale_msg(chat, "لینک محصول را کنار دستور بنویسید.")
+        plat.send_text(chat, "لینک محصول را کنار دستور بنویسید.")
         return
     row = fetch_by_link(links[0])
     r = sb("PATCH", T, {"product_id": f"eq.{row['product_id']}"}, {"active": flag}, "return=representation")
     if r.ok and r.json():
-        bale_msg(chat, f"{'✅ فعال شد' if flag else '⏸️ از چرخه خارج شد'}: {row['name']}")
+        plat.send_text(chat, f"{'✅ فعال شد' if flag else '⏸️ از چرخه خارج شد'}: {row['name']}")
     else:
-        bale_msg(chat, "این محصول در دیتابیس نیست؛ ابتدا با لینک اضافه‌اش کنید.")
+        plat.send_text(chat, "این محصول در دیتابیس نیست؛ ابتدا با لینک اضافه‌اش کنید.")
 
-def handle_callback(cb):
-    uid, data = cb["from"]["id"], cb.get("data")
-    chat = cb["message"]["chat"]["id"]
-    requests.post(f"{BALE_API}/answerCallbackQuery", json={"callback_query_id": cb["id"]}, timeout=15)
-    if uid not in ADMIN_USER_IDS:
-        return
-    if data == "add":
-        _waiting[uid] = "add"
-        bale_msg(chat, "لینک محصول را بفرستید (می‌توانید چند لینک را زیر هم بفرستید).")
-    elif data == "status":
-        bale_msg(chat, status_text())
-    elif data == "post":
-        bale_msg(chat, do_post(f"manual_{int(time.time())}"))
+def run_action(plat, uid, chat, action):
+    if action == "add":
+        _waiting[(plat.name, uid)] = "add"
+        plat.send_text(chat, "لینک محصول را بفرستید (می‌توانید چند لینک را زیر هم بفرستید).")
+    elif action == "status":
+        plat.send_text(chat, status_text())
+    elif action == "post":
+        plat.send_text(chat, do_post(f"manual_{int(time.time())}"))
 
-def handle_message(m):
-    uid = (m.get("from") or {}).get("id")
-    chat = m["chat"]["id"]
-    text = (m.get("text") or "").strip()
-    cmd = text.split(" ")[0].lower()
-    if cmd == "/myid":
-        bale_msg(chat, f"شناسه‌ی عددی شما: {uid}")
+def handle_event(plat, kind, uid, chat, data):
+    """ورودی یکسان برای هر سه پلتفرم: kind = message | button"""
+    uid = str(uid)
+    if kind == "message":
+        text = (data or "").strip()
+        cmd = text.split(" ")[0].split("@")[0].lower()
+        if cmd == "/myid":
+            plat.send_text(chat, f"شناسه‌ی شما در {plat.name}: {uid}\nشناسه‌ی این چت: {chat}")
+            return
+    if uid not in plat.admins:
         return
-    if uid not in ADMIN_USER_IDS:
+    if kind == "button":
+        run_action(plat, uid, chat, data)
         return
     if cmd in ("/start", "/menu", "/help"):
-        bale_menu(chat)
+        plat.send_menu(chat)
     elif cmd == "/status":
-        bale_msg(chat, status_text())
+        run_action(plat, uid, chat, "status")
     elif cmd == "/post":
-        bale_msg(chat, do_post(f"manual_{int(time.time())}"))
+        run_action(plat, uid, chat, "post")
     elif cmd in ("/off", "/on"):
         try:
-            set_active(chat, text, cmd == "/on")
+            set_active(plat, chat, text, cmd == "/on")
         except Exception as e:
-            bale_msg(chat, f"❌ {e}")
-    elif _waiting.get(uid) == "add" or SITE_URL.split("//")[-1] in text:
-        _waiting.pop(uid, None)
-        add_links(chat, text)
+            plat.send_text(chat, f"❌ {e}")
+    elif _waiting.get((plat.name, uid)) == "add" or SITE_URL.split("//")[-1] in text:
+        _waiting.pop((plat.name, uid), None)
+        add_links(plat, chat, text)
 
-def poll_loop():
-    try:
-        requests.post(f"{BALE_API}/deleteWebhook", timeout=15)
-    except Exception:
-        pass
-    offset = 0
+def _run_poll(plat):
     while True:
         try:
-            r = requests.get(f"{BALE_API}/getUpdates", params={"offset": offset, "timeout": 25}, timeout=40)
-            for u in r.json().get("result", []):
-                offset = u["update_id"] + 1
-                try:
-                    if u.get("callback_query"):
-                        handle_callback(u["callback_query"])
-                    elif u.get("message"):
-                        handle_message(u["message"])
-                except Exception as e:
-                    log.warning("handler: %s", e)
+            plat.poll(handle_event)
         except Exception as e:
-            log.warning("poll: %s", e)
-            time.sleep(5)
+            log.exception("poll %s: %s", plat.name, e)
+            time.sleep(10)
 
 # ------------------------- وب‌سرور (برای UptimeRobot) -------------------------
 app = Flask(__name__)
@@ -530,7 +658,8 @@ def start_background():
         return
     _started = True
     threading.Thread(target=scheduler_loop, daemon=True).start()
-    threading.Thread(target=poll_loop, daemon=True).start()
+    for plat in ALL_PLATFORMS:
+        threading.Thread(target=_run_poll, args=(plat,), daemon=True).start()
 
 start_background()
 
