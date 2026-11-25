@@ -524,9 +524,13 @@ def _ids(*keys):
                 s.add(x.strip())
     return s
 
+# آیدی ادمین ثبت سفارش در هر پلتفرم (در هر پلتفرم فرق دارد)
+DEFAULT_ADMIN_USERNAMES = {"BALE": "city_sofal", "RUBIKA": "Citysofal", "TELEGRAM": "Aso_babsor"}
+
 def build_platforms():
     def adm(key):
-        return env(f"ADMIN_USERNAME_{key}", "") or ADMIN_USERNAME
+        # اولویت: متغیر ADMIN_USERNAME_<پلتفرم> در رندر > آیدی پیش‌فرض همین پلتفرم > ADMIN_USERNAME عمومی
+        return env(f"ADMIN_USERNAME_{key}", "") or DEFAULT_ADMIN_USERNAMES.get(key, "") or ADMIN_USERNAME
     out = [Bale(BALE_TOKEN, BALE_TARGET, adm("BALE"), _ids("ADMIN_USER_IDS_BALE", "ADMIN_USER_IDS"))]
     if env("TELEGRAM_TOKEN"):
         out.append(Telegram(env("TELEGRAM_TOKEN"), env("TELEGRAM_TARGET"), adm("TELEGRAM"), _ids("ADMIN_USER_IDS_TELEGRAM")))
