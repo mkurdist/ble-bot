@@ -44,7 +44,7 @@ SITE_URL = env("SITE_URL", "https://citysofal.ir").rstrip("/")
 ADMIN_USERNAME = env("ADMIN_USERNAME", "").lstrip("@")
 ADMIN_PHONE = env("ADMIN_PHONE", "")
 POST_TIMES = [t.strip() for t in env("POST_TIMES", "10:00,13:00,16:00,19:00,21:00").split(",") if t.strip()]
-RUBIKA_LINK_BUTTON = env("RUBIKA_LINK_BUTTON", "false").lower() == "true"
+RUBIKA_LINK_BUTTON = env("RUBIKA_LINK_BUTTON", "true").lower() == "true"   # دکمه‌ی شیشه‌ای روبیکا؛ اگر خطا داد خودکار بدون دکمه می‌فرستد
 ORDER_MODE = env("ORDER_MODE", "random")               # random | sequential
 CATCHUP_MINUTES = int(env("CATCHUP_MINUTES", "180"))   # اگر سرور خواب بود تا چند دقیقه دیرتر هم پست بزند
 TZ = ZoneInfo(env("TZ_NAME", "Asia/Tehran"))
@@ -410,8 +410,20 @@ class Rubika(Platform):
     @staticmethod
     def _ok(j):
         return str(j.get("status", "")).upper() == "OK"
+    def admin_url(self):
+        return f"https://rubika.ir/{self.admin}"
+    def _inline(self, p):
+        """دکمه‌های شیشه‌ای زیر پست: مشاهده در سایت + ارسال پیام (Button از نوع Link)."""
+        def link(bid, label, url):
+            return {"id": bid, "type": "Link", "button_text": label,
+                    "button_link": {"type": "url", "link_url": url}}
+        rows = [{"buttons": [link("site", "مشاهده در سایت", p["permalink"])]}]
+        if self.admin:
+            rows.append({"buttons": [link("msg", "ارسال پیام", self.admin_url())]})
+        return {"rows": rows}
     def send_post(self, p, caption, img):
         text = f"{caption}\n\n🔗 {p['permalink']}"
+        kp = self._inline(p) if RUBIKA_LINK_BUTTON else None
         if img:
             try:
                 j = self._call("requestSendFile", {"type": "Image"})
@@ -420,21 +432,21 @@ class Rubika(Platform):
                 file_id = (up.get("data") or up).get("file_id")
                 if file_id:
                     payload = {"chat_id": self.target, "file_id": file_id, "text": text}
-                    if RUBIKA_LINK_BUTTON:   # آزمایشی: فیلد لینک در مستندات نیست
-                        payload["inline_keypad"] = {"rows": [{"buttons": [{
-                            "id": "site", "type": "Link", "button_text": "مشاهده در سایت",
-                            "button_link": {"type": "url", "link_url": p["permalink"]}}]}]}
+                    if kp:
+                        j = self._call("sendFile", dict(payload, inline_keypad=kp))
+                        if self._ok(j):
+                            return True
+                        log.warning("rubika sendFile با دکمه خطا داد، بدون دکمه تلاش می‌شود: %s", j)
                     j = self._call("sendFile", payload)
                     if self._ok(j):
                         return True
-                    if RUBIKA_LINK_BUTTON:
-                        payload.pop("inline_keypad", None)
-                        if self._ok(self._call("sendFile", payload)):
-                            return True
                     log.warning("rubika sendFile خطا: %s", j)
             except Exception as e:
                 log.warning("rubika file exception: %s", e)
-        j = self._call("sendMessage", {"chat_id": self.target, "text": text})
+        j = self._call("sendMessage", {"chat_id": self.target, "text": text, "inline_keypad": kp} if kp
+                       else {"chat_id": self.target, "text": text})
+        if not self._ok(j) and kp:
+            j = self._call("sendMessage", {"chat_id": self.target, "text": text})
         if not self._ok(j):
             log.error("rubika sendMessage خطا: %s", j)
         return self._ok(j)
